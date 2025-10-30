@@ -1,6 +1,9 @@
 import 'dart:async'; // Import async for StreamSubscription
+import 'dart:convert';
 import 'package:flutter/material.dart';
-// Make sure this path matches your file structure
+import 'package:http/http.dart' as http;
+// NOTE: We are no longer using speech_to_text
+// import 'package:speech_to_text/speech_to_text.dart';
 import 'package:nerfrontend/controller/soniox_controller.dart';
 
 // 1. CONVERSATION ENTRY MODEL (Same as before)
@@ -30,15 +33,25 @@ class LiveTranslatorView extends StatefulWidget {
 
 class _LiveTranslatorViewState extends State<LiveTranslatorView> {
   // --- State ---
-  late final SonioxController _controller;
+  // ✨ RENAMED controller to be specific
+  late final SonioxController _translationController;
   bool _isRecording = false;
   bool _isPaused = false;
   bool _enableDiarization = true;
 
   // List to accumulate all NER entities
   List<Map<String, dynamic>> _allNerEntities = [];
-  // Subscription to manage the NER stream listener
+  // ✨ RENAMED subscription
   late StreamSubscription _nerSubscription;
+
+  // --- Chat State ---
+  // ✨ NEW: Second controller for chat STT
+  late final SonioxController _chatSttController;
+  final TextEditingController _chatController = TextEditingController();
+  final List<Map<String, dynamic>> _chatMessages = [];
+  bool _isChatListening = false;
+  // ✨ NEW: Subscription for the chat controller
+  late StreamSubscription _chatStreamSubscription;
 
   final Map<String, String> _sourceLanguages = {
     'es': 'Spanish',
@@ -50,13 +63,15 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     'ml': 'Malayalam',
   };
 
+  final String _chatApiUrl = "http://127.0.0.1:8000/chat";
+
   @override
   void initState() {
     super.initState();
-    _controller = SonioxController();
 
-    // More efficient listener (from previous step)
-    _nerSubscription = _controller.nerStream.listen((newEntities) {
+    // --- 1. Init Translation Controller ---
+    _translationController = SonioxController();
+    _nerSubscription = _translationController.nerStream.listen((newEntities) {
       if (newEntities.isNotEmpty) {
         final existingEntityTexts =
             _allNerEntities.map((e) => e['text']?.toString()).toSet();
@@ -77,31 +92,42 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
         }
       }
     });
+
+    // --- 2. Init Chat STT Controller ---
+    _chatSttController = SonioxController();
+    // Listen to its conversation stream to get the transcription
+    _chatStreamSubscription =
+        _chatSttController.conversationStream.listen(_onChatResult);
   }
 
   @override
   void dispose() {
-    _nerSubscription.cancel(); // Cancel the subscription
-    _controller.dispose();
+    _translationController.dispose();
+    _chatSttController.dispose(); // ✨ NEW
+    _nerSubscription.cancel();
+    _chatStreamSubscription.cancel(); // ✨ NEW
+    _chatController.dispose();
     super.dispose();
   }
 
-  // --- UI Action Methods (Same as before) ---
+  // --- UI Action Methods (Main Translation) ---
   void _onStart() {
     final langCodes = _sourceLanguages.keys.toList();
-    _controller.start(
+    // Use the translation controller
+    _translationController.start(
       sourceLanguages: langCodes,
       enableSpeakerDiarization: _enableDiarization,
     );
     setState(() {
       _isRecording = true;
       _isPaused = false;
-      _allNerEntities.clear(); // Clear old entities on new session
+      _allNerEntities.clear();
+      _chatMessages.clear();
     });
   }
 
   void _onStop() {
-    _controller.stop();
+    _translationController.stop(); // Use the translation controller
     setState(() {
       _isRecording = false;
       _isPaused = false;
@@ -109,16 +135,166 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
   }
 
   void _onPause() {
-    _controller.pause();
+    _translationController.pause(); // Use the translation controller
     setState(() => _isPaused = true);
   }
 
   void _onResume() {
-    _controller.resume();
+    _translationController.resume(); // Use the translation controller
     setState(() => _isPaused = false);
   }
 
-  // --- ✨ MODIFIED Build Method ---
+  // --- Chat Methods ---
+
+  // This is called by the "Send" button (for TYPED text)
+  void _onSendChatMessage() {
+    final text = _chatController.text;
+    if (text.isEmpty) return;
+
+    // For typed messages, we DO add the user's message to the chat
+    setState(() {
+      _chatMessages.add({'sender': 'user', 'text': text});
+    });
+    _chatController.clear();
+
+    // This now calls the new API function
+    _processChatCommand(text);
+  }
+
+  // Called by the "Mic" button
+  void _onToggleChatListen() async {
+    if (_isChatListening) {
+      // --- Stop listening for chat ---
+      print("🎙️ CHAT: Stopping chat STT...");
+      _chatSttController.stop();
+      setState(() => _isChatListening = false);
+
+      // ✨ FIX: RESTART the main translator after a delay
+      if (_isRecording) {
+        print("🎙️ MAIN: Restarting translation/NER (with delay)...");
+        // ✨ Add a delay to let the chat mic release
+        await Future.delayed(const Duration(milliseconds: 300));
+        final langCodes = _sourceLanguages.keys.toList();
+        _translationController.start(
+          sourceLanguages: langCodes,
+          enableSpeakerDiarization: _enableDiarization,
+        );
+        setState(() => _isPaused = false); // We are no longer paused
+      }
+    } else {
+      // --- Start listening for chat ---
+      print("🎙️ CHAT: Starting chat STT (with delay)...");
+
+      // ✨ FIX: STOP the main translator
+      if (_isRecording && !_isPaused) {
+        print("🎙️ MAIN: Stopping translation/NER to free mic...");
+        _translationController.stop();
+      }
+
+      // ✨ Add a delay to let the main mic release
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      // Now it's safe to start the chat controller
+      setState(() => _isChatListening = true);
+      _chatSttController.start(
+        sourceLanguages: ['en'],
+        enableSpeakerDiarization: false,
+      );
+    }
+  }
+
+  // Listener for the chat controller's stream (for SPOKEN text)
+  void _onChatResult(List<ConversationEntry> entries) async {
+    if (!_isChatListening || entries.isEmpty) return;
+
+    final command = entries.last.original;
+    print("🎙️ CHAT: Received command: '$command'");
+
+    if (command.isNotEmpty) {
+      // 1. Stop the chat controller
+      print("🎙️ CHAT: Command received. Stopping chat STT.");
+      _chatSttController.stop();
+      setState(() {
+        _isChatListening = false;
+      });
+
+      // 2. Send the command to Gemini
+      print("🎙️ CHAT: Processing command with Gemini...");
+      // ✨ Await the Gemini call. This gives a natural delay.
+      _processChatCommand(command);
+
+      // 3. ✨ FIX: RESTART the main translator automatically
+      if (_isRecording) {
+        print("🎙️ MAIN: Restarting translation/NER...");
+        // You can add another small delay here if needed, but awaiting
+        // _processChatCommand is often enough.
+        // await Future.delayed(const Duration(milliseconds: 100)); 
+        final langCodes = _sourceLanguages.keys.toList();
+        _translationController.start(
+          sourceLanguages: langCodes,
+          enableSpeakerDiarization: _enableDiarization,
+        );
+        setState(() => _isPaused = false); // We are no longer paused
+      }
+    }
+  }
+
+  // This function calls your Gemini backend (Unchanged)
+  Future<void> _processChatCommand(String command) async {
+    // 1. Create the request body
+    final requestBody = json.encode({
+      'command': command,
+      'context': _allNerEntities // Send the current list as context
+    });
+
+    // ✨ Use the specific catch blocks from before
+    try {
+      // 2. Make the HTTP POST request
+      final response = await http.post(
+        Uri.parse(_chatApiUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: requestBody,
+      );
+
+      if (response.statusCode == 200) {
+        // ... (rest of the logic is the same)
+        final dynamic responseData = json.decode(response.body);
+        if (responseData is List) {
+          final newList = List<Map<String, dynamic>>.from(responseData);
+          if (newList.isNotEmpty && newList.first['label'] == 'ASSISTANT') {
+            _addBotResponse(newList.first['text']);
+          } else {
+            setState(() {
+              _allNerEntities = newList;
+            });
+            _addBotResponse("Done.");
+          }
+        }
+      } else {
+        _addBotResponse(
+            "Error: Could not reach AI assistant (Code ${response.statusCode})");
+      }
+    } on http.ClientException catch (clientError) {
+      // This handles network errors like "Connection refused"
+      print("Network error: ${clientError.message}");
+      _addBotResponse("Error: Cannot connect to assistant. Is the server running?");
+    } catch (e) {
+      // This catches all other errors
+      print("Unknown error: ${e.toString()}");
+      _addBotResponse("An unknown error occurred: ${e.toString()}");
+    }
+  }
+
+  // Helper to add a bot message to the chat (Unchanged)
+  void _addBotResponse(String text) {
+    Future.delayed(const Duration(milliseconds: 300), () {
+      setState(() {
+        _chatMessages.add({'sender': 'bot', 'text': text});
+      });
+    });
+  }
+
+  // --- Build Method (Unchanged) ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -131,24 +307,26 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
       backgroundColor: const Color(0xFFF0F2F5),
       body: Center(
         child: ConstrainedBox(
-          // ✨ CHANGED: Wider constraint for side-by-side layout
-          constraints: const BoxConstraints(maxWidth: 1200),
+          constraints: const BoxConstraints(maxWidth: 1600),
           child: Column(
             children: [
               _buildConfigPanel(),
               _buildControls(),
-              // ✨ CHANGED: Wrapped the two main sections in an Expanded Row
               Expanded(
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Expanded(
-                      flex: 2, // Conversation log takes 2/3 of the space
+                      flex: 2,
                       child: _buildConversationLog(),
                     ),
                     Expanded(
-                      flex: 1, // NER results take 1/3 of the space
+                      flex: 1,
                       child: _buildNerResults(),
+                    ),
+                    Expanded(
+                      flex: 1,
+                      child: _buildChatPanel(),
                     ),
                   ],
                 ),
@@ -160,8 +338,8 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     );
   }
 
+  // --- Config Panel (Unchanged) ---
   Widget _buildConfigPanel() {
-    // ... (This widget is unchanged)
     return Container(
       padding: const EdgeInsets.all(16.0),
       margin: const EdgeInsets.all(16.0),
@@ -209,8 +387,8 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     );
   }
 
+  // --- Controls (Unchanged) ---
   Widget _buildControls() {
-    // ... (This widget is unchanged)
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       child: Row(
@@ -247,11 +425,10 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     );
   }
 
-  // ✨ MODIFIED Widget
+  // --- Conversation Log (Unchanged) ---
   Widget _buildConversationLog() {
     return Container(
       padding: const EdgeInsets.all(16.0),
-      // ✨ CHANGED: Adjusted margin for side-by-side layout
       margin: const EdgeInsets.fromLTRB(16, 0, 8, 16),
       decoration: BoxDecoration(
         color: Colors.white,
@@ -259,7 +436,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
         border: Border.all(color: Colors.grey.shade300),
       ),
       child: StreamBuilder<List<ConversationEntry>>(
-        stream: _controller.conversationStream,
+        stream: _translationController.conversationStream,
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting &&
               !_isRecording) {
@@ -271,16 +448,23 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
             );
           }
           if (!snapshot.hasData || snapshot.data!.isEmpty) {
-            return const Center(
+            return Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 16),
-                  Text(
-                    'Listening...',
-                    style: TextStyle(fontSize: 16, color: Colors.grey),
-                  ),
+                  if (_isRecording) ...[
+                    const CircularProgressIndicator(),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Listening...',
+                      style: TextStyle(fontSize: 16, color: Colors.grey),
+                    ),
+                  ] else ...[
+                    const Text(
+                      'No conversation yet.',
+                      style: TextStyle(fontSize: 16, color: Colors.grey),
+                    ),
+                  ]
                 ],
               ),
             );
@@ -297,12 +481,11 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     );
   }
 
-  // ✨ MODIFIED Widget
+  // --- NER Results (Unchanged) ---
   Widget _buildNerResults() {
     return Container(
       padding: const EdgeInsets.all(16.0),
-      // ✨ CHANGED: Adjusted margin for side-by-side layout
-      margin: const EdgeInsets.fromLTRB(8, 0, 16, 16),
+      margin: const EdgeInsets.fromLTRB(8, 0, 8, 16),
       width: double.infinity,
       decoration: BoxDecoration(
         color: Colors.white,
@@ -364,15 +547,124 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     );
   }
 
-  // --- (This function is unchanged) ---
+  // --- Chat Panel (Unchanged) ---
+  Widget _buildChatPanel() {
+    return Container(
+      padding: const EdgeInsets.all(16.0),
+      margin: const EdgeInsets.fromLTRB(8, 0, 16, 16),
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey.shade300),
+     ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Chat Assistant',
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(fontWeight: FontWeight.bold),
+          ),
+          const Divider(),
+          Expanded(
+            child: _chatMessages.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.smart_toy_outlined,
+                            color: Colors.grey.shade400, size: 30),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Use the mic or text to edit entities',
+                          style: TextStyle(color: Colors.grey.shade600),
+                          textAlign: TextAlign.center,
+                        ),
+                       ],
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _chatMessages.length,
+                    itemBuilder: (context, index) {
+                      final message = _chatMessages[index];
+                      final isUser = message['sender'] == 'user';
+                      return Align(
+                        alignment:
+                         isUser ? Alignment.centerRight : Alignment.centerLeft,
+                        child: Container(
+                          padding: const EdgeInsets.all(10),
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          decoration: BoxDecoration(
+                            color: isUser
+                                ? Colors.blue.shade50
+                                : Colors.grey.shade200,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(message['text']),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          const Divider(),
+          _buildChatInput(), // New helper widget for the input bar
+        ],
+      ),
+    );
+  }
+
+  // --- Chat Input (Unchanged) ---
+  Widget _buildChatInput() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8.0),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _chatController,
+              decoration: InputDecoration(
+                hintText:
+                    _isChatListening ? 'Listening...' : 'Type or say "remove..."',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide(color: Colors.grey.shade400),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+              ),
+              onSubmitted: (_) => _onSendChatMessage(),
+            ),
+          ),
+          const SizedBox(width: 8),
+         IconButton(
+            icon: Icon(
+              _isChatListening ? Icons.mic_off_rounded : Icons.mic_rounded,
+              color: _isChatListening ? Colors.red.shade700 : Colors.blue.shade700,
+            ),
+           iconSize: 30,
+            onPressed: _onToggleChatListen, // This now uses Soniox
+          ),
+          IconButton(
+            icon: Icon(Icons.send_rounded, color: Colors.blue.shade700),
+            iconSize: 30,
+            onPressed: _onSendChatMessage,
+          ),
+        ],
+      ),
+   );
+  }
+
+  // --- Color Helper (Unchanged) ---
   Color _getColorForLabel(String label) {
     switch (label) {
       // --- Med7 Labels (Prescription) ---
       case 'DRUG':
-      case 'Medication': // From d4data model
+      case 'Medication':
         return Colors.blue.shade100;
       case 'DOSAGE':
-      case 'Dosage': // From d4data model
+      case 'Dosage':
         return Colors.green.shade100;
       case 'STRENGTH':
         return Colors.orange.shade100;
@@ -380,11 +672,11 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
         return Colors.purple.shade100;
       case 'ROUTE':
         return Colors.red.shade100;
-      case 'FREQUENCY':
-      case 'Frequency': // From d4data model
+     case 'FREQUENCY':
+      case 'Frequency':
         return Colors.teal.shade100;
       case 'DURATION':
-      case 'Duration': // From d4data model
+      case 'Duration':
         return Colors.indigo.shade100;
 
       // --- d4data/biomedical-ner-all Labels (Symptoms/Diagnosis) ---
@@ -392,7 +684,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
         return Colors.red.shade200;
       case 'Diagnostic_procedure':
         return Colors.yellow.shade200;
-      case 'Lab_value':
+     case 'Lab_value':
         return Colors.cyan.shade100;
       case 'Biological_structure':
         return Colors.lime.shade200;
@@ -402,8 +694,12 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
       // --- Other d4data labels ---
       case 'Age':
         return Colors.brown.shade100;
-      case 'Date':
+     case 'Date':
         return Colors.grey.shade300;
+
+      // --- NEW ---
+      case 'CUSTOM':
+        return Colors.amber.shade100;
 
       // Default fallback
       default:
@@ -411,7 +707,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     }
   }
 
-  // --- (This widget is unchanged) ---
+  // --- Conversation Bubble (Unchanged) ---
   Widget _buildConversationBubble(ConversationEntry entry) {
     final isSpeakerA = (entry.speaker == '1');
     final alignment =
@@ -421,7 +717,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
     final margin = isSpeakerA
         ? const EdgeInsets.only(right: 40.0)
         : const EdgeInsets.only(left: 40.0);
-    final bool isPending = (entry.translation == '...');
+   final bool isPending = (entry.translation == '...');
 
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 4.0),
@@ -431,7 +727,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
         children: [
           Text(
             'Speaker ${entry.speaker} (${entry.langCode})',
-            style: const TextStyle(fontSize: 12, color: Colors.grey),
+           style: const TextStyle(fontSize: 12, color: Colors.grey),
           ),
           const SizedBox(height: 4),
           Container(
@@ -443,7 +739,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
+              Text(
                   entry.original,
                   style: const TextStyle(fontSize: 16, color: Colors.black87),
                 ),
@@ -455,7 +751,7 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
                       SizedBox(
                         width: 12,
                         height: 12,
-                        child: CircularProgressIndicator(
+                     child: CircularProgressIndicator(
                             strokeWidth: 2, color: Colors.grey.shade600),
                       ),
                       const SizedBox(width: 8),
@@ -465,21 +761,21 @@ class _LiveTranslatorViewState extends State<LiveTranslatorView> {
                           fontSize: 16,
                           color: Colors.grey.shade600,
                           fontStyle: FontStyle.italic,
-                        ),
+                    ),
                       ),
                     ],
                   )
-                else
+               else
                   Text(
                     entry.translation,
                     style: TextStyle(
                       fontSize: 16,
                       color: Colors.black.withOpacity(0.7),
-                      fontStyle: FontStyle.italic,
+                    fontStyle: FontStyle.italic,
                     ),
                   ),
               ],
-            ),
+           ),
           ),
         ],
       ),
