@@ -22,9 +22,10 @@ class SonioxController {
 
   // --- NER WebSocket ---
   html.WebSocket? _nerWebSocket;
-  final String _nerApiUrl = 'ws://127.0.0.1:8000/ws/ner';
-  final _nerStreamController = StreamController<List<Map<String, dynamic>>>.broadcast();
-  Stream<List<Map<String, dynamic>>> get nerStream => _nerStreamController.stream;
+  // final String _nerApiUrl = 'ws://0.0.0.0:8000/ws/ner';
+  final String _nerApiUrl = 'wss://voicebackend.oxzygen.com/ws/ner';
+final _nerStreamController = StreamController<Map<String, dynamic>>.broadcast();
+Stream<Map<String, dynamic>> get nerStream => _nerStreamController.stream;
 
 
   // Internal state
@@ -98,9 +99,18 @@ class SonioxController {
       });
 
       _nerWebSocket!.onMessage.listen((event) {
-        final List<dynamic> entitiesJson = jsonDecode(event.data as String);
-        final entities = entitiesJson.cast<Map<String, dynamic>>();
-        _nerStreamController.add(entities); 
+        // 1. Decode the message
+        final data = jsonDecode(event.data as String);
+        
+
+        // 2. Check that it's a Map, not a List
+        if (data is Map<String, dynamic>) {
+          // 3. Add the whole Map to the stream
+          _nerStreamController.add(data);
+        } else {
+          // This might happen if the backend sends an error
+          debugPrint('NER WebSocket Error: Received unexpected data format.');
+        }
       });
 
       _nerWebSocket!.onError.listen((event) {
